@@ -2,13 +2,38 @@ import argparse
 import asyncio
 import logging, json, threading, sys
 import requests, websockets
+import numpy
 
+from av import VideoFrame
 from enum import Enum
 
-from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
+from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer, VideoStreamTrack
 from aiortc.sdp import candidate_from_sdp, candidate_to_sdp
+from aiortc.contrib.media import MediaBlackhole, MediaRecorder, MediaPlayer
 
 logger = logging.getLogger('xirsysapp')
+
+def create_rectangle(width, height, color):
+    data_bgr = numpy.zeros((height, width, 3), numpy.uint8)
+    data_bgr[:, :] = color
+    return data_bgr
+
+class FlagVideoStreamTrack(VideoStreamTrack):
+    def __init__(self):
+        super().__init__()  # don't forget this!
+        self.data_bgr = numpy.hstack([
+            create_rectangle(width=213, height=480, color=(255, 0, 0)),      # blue
+            create_rectangle(width=214, height=480, color=(255, 255, 255)),  # white
+            create_rectangle(width=213, height=480, color=(0, 0, 255)),      # red
+        ])
+
+    async def recv(self):
+        pts, time_base = await self.next_timestamp()
+
+        frame = VideoFrame.from_ndarray(self.data_bgr, format='bgr24')
+        frame.pts = pts
+        frame.time_base = time_base
+        return frame
 
 class PeerConnection():
 
@@ -21,9 +46,11 @@ class PeerConnection():
         DISCONNECTED = 6
         TERMINATED = 7
 
-    def __init__(self, user_name, xirsys_url):
+    def __init__(self, user_name, xirsys_url, channel_name, video_file):
         self._user = user_name
         self._xirsys_url = xirsys_url
+        self._channel_name = channel_name
+        self._video_file = video_file
         self._state = self.PcState.ICE_NOT_READY
 
         self._wsurl = None
@@ -44,19 +71,19 @@ class PeerConnection():
         
         # 1. get ice servers
         url = "{}/getice.php".format(self._xirsys_url)
-        r = requests.post(url, verify=False, data={'channel': 'sampleAppChannel'})
+        r = requests.post(url, verify=False, data={'channel': self._channel_name})
         ice_servers = r.json()['v']
         logger.debug('successfully retrieved ice hosts: \t{}'.format(ice_servers))
 
         # 2. getting a temp token
         url = "{}/gettoken.php".format(self._xirsys_url)
-        r = requests.post(url, verify=False, data={'username': self._user, 'channel': 'sampleAppChannel'})
+        r = requests.post(url, verify=False, data={'username': self._user, 'channel': self._channel_name})
         token = r.json()['v']
         logger.debug('successfully retrieved a token: \t{}'.format(token))
 
         # 3. getting a host
         url = "{}/gethost.php".format(self._xirsys_url)
-        r = requests.post(url, verify=False, data={'username': self._user, 'channel': 'sampleAppChannel'})
+        r = requests.post(url, verify=False, data={'username': self._user, 'channel': self._channel_name})
         wshost = r.json()['v']
         logger.debug('successfuly retrieved a host: \t{}'.format(wshost))
 
@@ -64,6 +91,18 @@ class PeerConnection():
         self._wsurl = '{}/v2/{}'.format(wshost, token)
         config = self.generate_rtc_configuration(ice_servers)
         self._pc = RTCPeerConnection(config);
+
+        # 5. add track event callback
+        logger.debug('preparing black hole media as a sink')
+        self._recorder = MediaBlackhole()
+        @self._pc.on('track')
+        def on_track(track):
+            logger.debug('received track, adding...')
+            if track.kind == 'video':
+                self._recorder.addTrack(track)
+                logger.debug('added track')
+            else:
+                logger.debug('can not add a track of {}'.format(track.kind))
 
         # change the state
         self.state = self.PcState.ICE_READY
@@ -157,7 +196,7 @@ class PeerConnection():
                             self.state = self.PcState.ICING
 
                             # call this peer
-                            await self.call_peer(websocket, joined)
+                            #await self.call_peer(websocket, joined)
 
                     elif msg_objective == 'peer_removed':
 
@@ -201,10 +240,10 @@ class PeerConnection():
                 except asyncio.TimeoutError:
                     logger.debug('regular timeout occured...')
 
-                    if self._state == self.PcState.CONNECTING:
-                        logger.debug('ice got completed, closing the websocket connection...')
-                        await websocket.close()
-                        logger.debug('closed the websocket connection')
+                    #if self._state == self.PcState.CONNECTING:
+                    #    logger.debug('ice got completed, closing the websocket connection...')
+                    #    await websocket.close()
+                    #    logger.debug('closed the websocket connection')
 
                 except websockets.exceptions.ConnectionClosed:
                     logger.error('websocket connection closed')
@@ -213,50 +252,58 @@ class PeerConnection():
 
     async def keep_datachannel(self):
 
-        # wait for a while until connection is established
-        waited = 0
-        while self._state == self.PcState.CONNECTING and waited < 10:
-            if self._channel.readyState == 'open':
-                self.state = self.PcState.CONNECTED
-            else:
-                logger.debug('waiting for a data connection is established, the current channel state = {}...'.format(self._channel.readyState))
-                await asyncio.sleep(1)
-            waited += 1
+        if self._channel is None:
 
-        if waited == 10:
-            raise Exception('failed to establish a data connection')
+            logger.debug('no data channel is opening...')
 
-        if not self._state == self.PcState.CONNECTED:
-            logger.error('a channel is not opened yet, nothing to do')
-            return
+        else:
 
-        @self._channel.on('message')
-        def on_message(message):
-            logger.debug('message arrived:\t{}'.format(message))
-            try:
-                js_message = json.loads(message)
-                message_from = js_message['f']
-                message_text = js_message['msg']
-                logger.info('({})<<===({}) \t{}'.format(self._user, message_from, message_text))
-                echo = {'f': self._user, 'msg': message_text}
-                self._channel.send(json.dumps(echo))
-                logger.info('({})===({})>> \t{}'.format(self._user, message_from, message_text))
-            except Exception as e:
-                logger.exception('failed at a message handling')
+            # wait for a while until connection is established
+            waited = 0
+            while self._state == self.PcState.CONNECTING and waited < 10:
+                if self._channel.readyState == 'open':
+                    self.state = self.PcState.CONNECTED
+                else:
+                    logger.debug('waiting for a data connection is established, the current channel state = {}...'.format(self._channel.readyState))
+                    await asyncio.sleep(1)
+                waited += 1
+
+            if waited == 10:
+                raise Exception('failed to establish a data connection')
+
+            if not self._state == self.PcState.CONNECTED:
+                logger.error('a channel is not opened yet, nothing to do')
+                return
+
+            @self._channel.on('message')
+            def on_message(message):
+                logger.debug('message arrived:\t{}'.format(message))
+                try:
+                    js_message = json.loads(message)
+                    message_from = js_message['f']
+                    message_text = js_message['msg']
+                    logger.info('({})<<===({}) \t{}'.format(self._user, message_from, message_text))
+                    echo = {'f': self._user, 'msg': message_text}
+                    self._channel.send(json.dumps(echo))
+                    logger.info('({})===({})>> \t{}'.format(self._user, message_from, message_text))
+                except Exception as e:
+                    logger.exception('failed at a message handling')
         
         while self._state == self.PcState.CONNECTED:
 
             try:
 
-                logger.debug('the current state of the rtcs transport = {}'.format(self._channel.transport.state))
-                logger.debug('the current state of the dtls transport = {}'.format(self._channel.transport.transport.state))
+                if self._channel is not None:
 
-                # TODO: disconnect the remote peer after a data exchange, then this won't get triggered
-                if self._channel.transport.transport.state == 'closed':
-                    self.state = self.PcState.DISCONNECTED
-                    logger.debug('current state = {}'.format(self._state))
-                else:
-                    await asyncio.sleep(1)
+                    logger.debug('the current state of the rtcs transport = {}'.format(self._channel.transport.state))
+                    logger.debug('the current state of the dtls transport = {}'.format(self._channel.transport.transport.state))
+
+                    # TODO: disconnect the remote peer after a data exchange, then this won't get triggered
+                    if self._channel.transport.transport.state == 'closed':
+                        self.state = self.PcState.DISCONNECTED
+                        logger.debug('current state = {}'.format(self._state))
+
+                await asyncio.sleep(1)
 
             except Exception as e:
                 logger.exception('an handled exception at keeping a data channel')
@@ -274,6 +321,10 @@ class PeerConnection():
 
         self.setup_iceevents()
 
+        # add a video track
+        logger.debug('adding a flag video stream as a track')
+        self._pc.addTrack(self.get_video_stream_track())
+
         # create an offer, and set local
         logger.debug('creating an offer, and setting as a local description')
         await self._pc.setLocalDescription(await self._pc.createOffer())
@@ -284,7 +335,7 @@ class PeerConnection():
             'sdp': self._pc.localDescription.sdp,
             'type': self._pc.localDescription.type
         }
-        js_offer = {'t': 'u', 'm': {'f': "SampleAppChannel/{}".format(self._user), 'o': 'message', 't': peer}, 'p': {'msg':js_desc}};
+        js_offer = {'t': 'u', 'm': {'f': "{}/{}".format(self._channel_name, self._user), 'o': 'message', 't': peer}, 'p': {'msg':js_desc}};
         await self.send_message(websocket, json.dumps(js_offer))
 
     async def make_answer(self, websocket, data):
@@ -305,6 +356,14 @@ class PeerConnection():
 
         self.setup_iceevents()
 
+        # recorder start
+        logger.debug('starting a black hole recorder...')
+        await self._recorder.start()
+
+        # add a video track
+        logger.debug('adding a flag video stream as a track')
+        self._pc.addTrack(self.get_video_stream_track())
+
         # create offer
         logger.debug('creating offer, and then setting as a local description...')
         local_desc = await self._pc.createAnswer()
@@ -316,7 +375,7 @@ class PeerConnection():
             'sdp': self._pc.localDescription.sdp,
             'type': self._pc.localDescription.type
         }
-        js_answer = {'t': 'u', 'm': {'f': "SampleAppChannel/{}".format(self._user), 'o': 'message', 't': peer}, 'p': {'msg':js_desc}};
+        js_answer = {'t': 'u', 'm': {'f': "{}/{}".format(self._channel_name, self._user), 'o': 'message', 't': peer}, 'p': {'msg':js_desc}};
         await self.send_message(websocket, json.dumps(js_answer))
 
     async def accept_answer(self, data):
@@ -327,6 +386,25 @@ class PeerConnection():
         logger.debug('setting a remote description...')
         remote_desc = RTCSessionDescription(**data['p']['msg']);
         await self._pc.setRemoteDescription(remote_desc)
+
+        # recorder start
+        logger.debug('starting a black hole recorder...')
+        await self._recorder.start()
+
+    def get_video_stream_track(self):
+
+        logger.debug('getting a video stream track with {}'.format(self._video_file))
+        stream_track = None
+
+        try:
+            player = MediaPlayer(self._video_file)
+            stream_track = player.video
+        except Exception as e:
+            stream_track = FlagVideoStreamTrack()
+
+        logger.debug('got a video stream track as {}'.format(stream_track))
+
+        return stream_track
 
     def setup_iceevents(self):
 
@@ -353,12 +431,15 @@ class PeerConnection():
 
     async def close(self):
 
+        await self._recorder.stop()
         await self._pc.close()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='xirsys python cli with aiortc')
     parser.add_argument('xirsys_url', help='an url prefix where getice.php, gethost.php, and gettoken.php from the official getting started guide are located. e.g. https://your.domain.com/xirsys')
     parser.add_argument('user_name', help='a user name for a signaling')
+    parser.add_argument('--channel_name', '-c', default='sampleAppChannel', help='a xirsys channel name')
+    parser.add_argument('--video_file', '-f', help='a file path to play')
     parser.add_argument('--verbose', '-v', action='store_true', help='debug logging enabled if set')
 
     args = parser.parse_args()
@@ -375,7 +456,7 @@ if __name__ == '__main__':
 
     logger.info("getting xirsys ice hosts and tokens as {} with {}".format(args.user_name, args.xirsys_url))
 
-    conn = PeerConnection(args.user_name, args.xirsys_url)
+    conn = PeerConnection(args.user_name, args.xirsys_url, args.channel_name, args.video_file)
 
     asyncio.run(conn.run())
 
