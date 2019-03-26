@@ -21,10 +21,11 @@ class PeerConnection():
         DISCONNECTED = 6
         TERMINATED = 7
 
-    def __init__(self, user_name, xirsys_url, active_ping):
+    def __init__(self, user_name, xirsys_url, active_ping, disable_ping_interval):
         self._user = user_name
         self._xirsys_url = xirsys_url
         self._active_ping = active_ping
+        self._disable_ping_interval = disable_ping_interval
         self._state = self.PcState.ICE_NOT_READY
 
         self._wsurl = None
@@ -122,8 +123,12 @@ class PeerConnection():
 
         logger.debug('the websocket url for the signaling is: \t{}'.format(self._wsurl))
 
+        ping_interval = 20
+        if self._disable_ping_interval:
+            ping_interval = None
+
         logger.debug('connecting...')
-        async with websockets.client.connect(self._wsurl) as websocket:
+        async with websockets.client.connect(self._wsurl, ping_interval=ping_interval) as websocket:
 
             while not self._state == self.PcState.TERMINATED and websocket.open:
 
@@ -164,7 +169,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='xirsys python cli with aiortc')
     parser.add_argument('xirsys_url', help='an url prefix where getice.php, gethost.php, and gettoken.php from the official getting started guide are located. e.g. https://your.domain.com/xirsys')
     parser.add_argument('user_name', help='a user name for a signaling')
-    parser.add_argument('--active_ping', '-a', action='store_true', help='Send a ping message actively')
+    parser.add_argument('--active_ping', '-a', action='store_true', help='send a ping message actively')
+    parser.add_argument('--disable_ping_interval', '-p', action='store_true', help='disable to send a ping at an interval')
     parser.add_argument('--verbose', '-v', action='store_true', help='debug logging enabled if set')
 
     args = parser.parse_args()
@@ -181,7 +187,7 @@ if __name__ == '__main__':
 
     logger.info("getting xirsys ice hosts and tokens as {} with {}".format(args.user_name, args.xirsys_url))
 
-    conn = PeerConnection(args.user_name, args.xirsys_url, args.active_ping)
+    conn = PeerConnection(args.user_name, args.xirsys_url, args.active_ping, args.disable_ping_interval)
 
     asyncio.run(conn.run())
 

@@ -46,11 +46,12 @@ class PeerConnection():
         DISCONNECTED = 6
         TERMINATED = 7
 
-    def __init__(self, user_name, xirsys_url, channel_name, video_file):
+    def __init__(self, user_name, xirsys_url, channel_name, video_file, disable_ping_interval):
         self._user = user_name
         self._xirsys_url = xirsys_url
         self._channel_name = channel_name
         self._video_file = video_file
+        self._disable_ping_interval = disable_ping_interval
         self._state = self.PcState.ICE_NOT_READY
 
         self._wsurl = None
@@ -143,10 +144,6 @@ class PeerConnection():
                 logger.info('starting signaling...')
                 await self.keep_signaling()
 
-                #2. once established, keep data channel open
-                logger.info('starting data channel...')
-                await self.keep_datachannel()
-
             except KeyboardInterrupt:
 
                 logger.info('detected Ctrl+C, terminating...')
@@ -167,8 +164,12 @@ class PeerConnection():
 
         logger.debug('the websocket url for the signaling is: \t{}'.format(self._wsurl))
 
+        ping_interval = 20
+        if self._disable_ping_interval:
+            ping_interval = None
+
         logger.debug('connecting...')
-        async with websockets.client.connect(self._wsurl) as websocket:
+        async with websockets.client.connect(self._wsurl, ping_interval=ping_interval) as websocket:
 
             while not self._state == self.PcState.TERMINATED and websocket.open:
 
@@ -194,9 +195,6 @@ class PeerConnection():
                         if joined != self._user:
 
                             self.state = self.PcState.ICING
-
-                            # call this peer
-                            #await self.call_peer(websocket, joined)
 
                     elif msg_objective == 'peer_removed':
 
@@ -250,93 +248,9 @@ class PeerConnection():
 
         logging.debug('finished signaling')
 
-    async def keep_datachannel(self):
-
-        if self._channel is None:
-
-            logger.debug('no data channel is opening...')
-
-        else:
-
-            # wait for a while until connection is established
-            waited = 0
-            while self._state == self.PcState.CONNECTING and waited < 10:
-                if self._channel.readyState == 'open':
-                    self.state = self.PcState.CONNECTED
-                else:
-                    logger.debug('waiting for a data connection is established, the current channel state = {}...'.format(self._channel.readyState))
-                    await asyncio.sleep(1)
-                waited += 1
-
-            if waited == 10:
-                raise Exception('failed to establish a data connection')
-
-            if not self._state == self.PcState.CONNECTED:
-                logger.error('a channel is not opened yet, nothing to do')
-                return
-
-            @self._channel.on('message')
-            def on_message(message):
-                logger.debug('message arrived:\t{}'.format(message))
-                try:
-                    js_message = json.loads(message)
-                    message_from = js_message['f']
-                    message_text = js_message['msg']
-                    logger.info('({})<<===({}) \t{}'.format(self._user, message_from, message_text))
-                    echo = {'f': self._user, 'msg': message_text}
-                    self._channel.send(json.dumps(echo))
-                    logger.info('({})===({})>> \t{}'.format(self._user, message_from, message_text))
-                except Exception as e:
-                    logger.exception('failed at a message handling')
-        
-        while self._state == self.PcState.CONNECTED:
-
-            try:
-
-                if self._channel is not None:
-
-                    logger.debug('the current state of the rtcs transport = {}'.format(self._channel.transport.state))
-                    logger.debug('the current state of the dtls transport = {}'.format(self._channel.transport.transport.state))
-
-                    # TODO: disconnect the remote peer after a data exchange, then this won't get triggered
-                    if self._channel.transport.transport.state == 'closed':
-                        self.state = self.PcState.DISCONNECTED
-                        logger.debug('current state = {}'.format(self._state))
-
-                await asyncio.sleep(1)
-
-            except Exception as e:
-                logger.exception('an handled exception at keeping a data channel')
-                raise e
-
     async def send_message(self, websocket, message):
         logger.debug('sending the following message over websocket: \t{}'.format(message))
         await websocket.send(message)
-
-    async def call_peer(self, websocket, peer):
-
-        logger.info('calling {}...'.format(peer))
-        self._channel = self._pc.createDataChannel('data')
-        logger.debug('created a datachannel')
-
-        self.setup_iceevents()
-
-        # add a video track
-        logger.debug('adding a flag video stream as a track')
-        self._pc.addTrack(self.get_video_stream_track())
-
-        # create an offer, and set local
-        logger.debug('creating an offer, and setting as a local description')
-        await self._pc.setLocalDescription(await self._pc.createOffer())
-
-        # send via signaling
-        logger.debug('sending an offer...')
-        js_desc = {
-            'sdp': self._pc.localDescription.sdp,
-            'type': self._pc.localDescription.type
-        }
-        js_offer = {'t': 'u', 'm': {'f': "{}/{}".format(self._channel_name, self._user), 'o': 'message', 't': peer}, 'p': {'msg':js_desc}};
-        await self.send_message(websocket, json.dumps(js_offer))
 
     async def make_answer(self, websocket, data):
 
@@ -440,6 +354,7 @@ if __name__ == '__main__':
     parser.add_argument('user_name', help='a user name for a signaling')
     parser.add_argument('--channel_name', '-c', default='sampleAppChannel', help='a xirsys channel name')
     parser.add_argument('--video_file', '-f', help='a file path to play')
+    parser.add_argument('--disable_ping_interval', '-p', action='store_true', help='disable to send a ping at an interval')
     parser.add_argument('--verbose', '-v', action='store_true', help='debug logging enabled if set')
 
     args = parser.parse_args()
@@ -456,7 +371,7 @@ if __name__ == '__main__':
 
     logger.info("getting xirsys ice hosts and tokens as {} with {}".format(args.user_name, args.xirsys_url))
 
-    conn = PeerConnection(args.user_name, args.xirsys_url, args.channel_name, args.video_file)
+    conn = PeerConnection(args.user_name, args.xirsys_url, args.channel_name, args.video_file, args.disable_ping_interval)
 
     asyncio.run(conn.run())
 
