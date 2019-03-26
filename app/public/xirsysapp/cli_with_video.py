@@ -1,6 +1,6 @@
 import argparse
 import asyncio
-import logging, json, threading, sys
+import logging, json, threading, sys, subprocess, os
 import requests, websockets
 import numpy
 
@@ -57,7 +57,8 @@ class PeerConnection():
         self._wsurl = None
         self._socket = None
         self._ice_state = None
-        self._channel = None
+        self._sender = None
+        self._caller = None
 
     @property
     def state(self):
@@ -203,33 +204,55 @@ class PeerConnection():
 
                     elif msg_objective == 'message':
 
-                        msg_type = data['p']['msg']['type']
+                        msg = data['p']['msg']
 
-                        if msg_type == 'offer':
+                        if 'type' in msg:
 
-                            logger.info('received an offer')
-                            self.state = self.PcState.ICING
-                            await self.make_answer(websocket, data)
+                            msg_type = msg['type']
 
-                        elif msg_type == 'answer':
+                            if msg_type == 'offer':
 
-                            logger.info('received an answer')
+                                logger.info('received an offer')
+                                self.state = self.PcState.ICING
+                                await self.make_answer(websocket, data)
 
-                            await self.accept_answer(data)
+                            elif msg_type == 'answer':
 
-                        elif msg_type == 'candidate':
+                                logger.info('received an answer')
 
-                            message = data['p']['msg']
-                            logger.debug('received a candidate\t{}'.format(message))
-                            candidate = candidate_from_sdp(message['candidate'].split(':', 1)[1])
-                            candidate.sdpMid = message['sdpMid']
-                            candidate.spdMLineIndex = message['sdpMLineIndex']
-                            logger.debug('adding a candidate:\t{}'.format(candidate))
-                            self._pc.addIceCandidate(candidate)
+                            elif msg_type == 'candidate':
+
+                                message = data['p']['msg']
+                                logger.debug('received a candidate\t{}'.format(message))
+                                candidate = candidate_from_sdp(message['candidate'].split(':', 1)[1])
+                                candidate.sdpMid = message['sdpMid']
+                                candidate.spdMLineIndex = message['sdpMLineIndex']
+                                logger.debug('adding a candidate:\t{}'.format(candidate))
+                                self._pc.addIceCandidate(candidate)
+
+                            elif msg_type == 'action':
+
+                                if 'internal' in msg:
+
+                                    code = msg['code']
+
+                                    if code == 'rtc.p2p.close':
+
+                                        logger.info('the call was closed')
+
+                                    elif code == 'rtc.p2p.deny':
+
+                                        logger.info('the call was denied')
+
+                            else:
+
+                                logger.warning('unknown message type: {}'.format(msg_type))
 
                         else:
 
-                            logger.warn('unknown message type: {}'.format(msg_type))
+                            logger.info('received a command message:\t{}'.format(msg))
+
+                            await self.execute_and_send(websocket, msg)
 
                     else:
 
@@ -238,15 +261,33 @@ class PeerConnection():
                 except asyncio.TimeoutError:
                     logger.debug('regular timeout occured...')
 
-                    #if self._state == self.PcState.CONNECTING:
-                    #    logger.debug('ice got completed, closing the websocket connection...')
-                    #    await websocket.close()
-                    #    logger.debug('closed the websocket connection')
+                    if self.state == self.PcState.DISCONNECTED:
+                        break
 
                 except websockets.exceptions.ConnectionClosed:
                     logger.error('websocket connection closed')
 
         logging.debug('finished signaling')
+
+    async def execute_and_send(self, websocket, message):
+
+        logger.debug('executing {}'.format(message))
+
+        output = None
+        try:
+            args = message.split(' ')
+            output = subprocess.check_output(args)
+            logger.debug('binary output: {}'.format(output))
+            output = output.decode('ascii')
+            logger.debug('text output: {}'.format(output))
+            output = output.replace('\n', '<BR>')
+            logger.debug('html output: {}'.format(output))
+        except:
+            output = 'can not execute {}'.format(message)
+
+        js_output = {'t': 'u', 'm': {'f': "{}/{}".format(self._channel_name, self._user), 'o': 'message', 't': self._caller}, 'p': {'msg': '{}'.format(output)}};
+
+        await self.send_message(websocket, json.dumps(js_output))
 
     async def send_message(self, websocket, message):
         logger.debug('sending the following message over websocket: \t{}'.format(message))
@@ -255,14 +296,8 @@ class PeerConnection():
     async def make_answer(self, websocket, data):
 
         peer = data['m']['f'].split('/')[-1];
-        logger.info('making an answer to {}'.format(peer))
-
-        # datachannel event is emitted inside setRemoteDescription
-        @self._pc.on('datachannel')
-        def on_datachannel(channel):
-
-            logger.debug('on datachannel')
-            self._channel = channel
+        self._caller = peer
+        logger.info('making an answer to {}'.format(self._caller))
 
         logger.debug('setting a remote description...')
         remote_desc = RTCSessionDescription(**data['p']['msg']);
@@ -276,7 +311,8 @@ class PeerConnection():
 
         # add a video track
         logger.debug('adding a flag video stream as a track')
-        self._pc.addTrack(self.get_video_stream_track())
+        self._sender = self._pc.addTrack(self.get_video_stream_track())
+        self.setup_transport_events()
 
         # create offer
         logger.debug('creating offer, and then setting as a local description...')
@@ -289,21 +325,8 @@ class PeerConnection():
             'sdp': self._pc.localDescription.sdp,
             'type': self._pc.localDescription.type
         }
-        js_answer = {'t': 'u', 'm': {'f': "{}/{}".format(self._channel_name, self._user), 'o': 'message', 't': peer}, 'p': {'msg':js_desc}};
+        js_answer = {'t': 'u', 'm': {'f': "{}/{}".format(self._channel_name, self._user), 'o': 'message', 't': self._caller}, 'p': {'msg':js_desc}};
         await self.send_message(websocket, json.dumps(js_answer))
-
-    async def accept_answer(self, data):
-
-        peer = data['m']['f'].split('/')[-1];
-        logger.info('got an answer from {}'.format(peer))
-
-        logger.debug('setting a remote description...')
-        remote_desc = RTCSessionDescription(**data['p']['msg']);
-        await self._pc.setRemoteDescription(remote_desc)
-
-        # recorder start
-        logger.debug('starting a black hole recorder...')
-        await self._recorder.start()
 
     def get_video_stream_track(self):
 
@@ -332,6 +355,13 @@ class PeerConnection():
             if self._pc.iceConnectionState == 'completed':
                 self.state = self.PcState.CONNECTING
                 logger.debug('current state = {}'.format(self._state))
+
+    def setup_transport_events(self):
+        @self._sender.transport.on('statechange')
+        async def on_dtlsstatechanged():
+            logger.debug('dtls state changed to {}'.format(self._sender.transport.state))
+            if self._sender.transport.state == 'closed':
+                self.state = self.PcState.DISCONNECTED
 
     async def cleanup(self):
 
