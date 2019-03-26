@@ -1,0 +1,193 @@
+<html>
+    <head>
+        <title>Xirsys Demo</title>
+        <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.2.1/jquery.min.js"></script>
+    </head>
+    <body>
+        <div>
+            username: <input type="text" id="username" />
+            <button id="connectButton" onclick="connect()">connect</button>
+        </div>
+
+        <div>
+            your message: <input type="text" id="newMessage" disabled />
+            <button id="sendButton" onclick="send()" disabled>send</button>
+        </div>
+
+        <div id="messages">
+        </div>
+        <script>
+            var token;
+            var socket;
+            var ice;
+            var pc;
+            var localUsername;
+            var dataChannel;
+            function displayMessage(message) {
+                $('#messages')[0].innerHTML += message + "<br>";
+            }
+            window.onload = () => {
+                $.post("getice.php", {channel: 'sampleAppChannel'}, r => onIce(r));
+            }
+            function onIce(r) {
+                ice = JSON.parse(r).v;
+                pc = new RTCPeerConnection(ice);
+                displayMessage("peer connection state:" + pc.connectionState);
+            }
+            function connect() {
+                localUsername = $('#username')[0].value;
+                $.post("gettoken.php", {username: $('#username')[0].value, channel: 'sampleAppChannel'}, r => getHost(r));
+            }
+            function getHost(r) {
+                token = JSON.parse(r).v;
+                $.post("gethost.php", {username: $('#username')[0].value, channel: 'sampleAppChannel'}, r => openSocket(r));
+            }
+            function openSocket(r) {
+                var host = JSON.parse(r).v;
+                socket = new WebSocket(host + "/v2/" + token);
+                socket.addEventListener("message", onSocketMessage);
+            }
+            function onSocketMessage(evt) {
+                console.log(evt);
+                var data = JSON.parse(evt.data);
+                var option;
+                var messagesElement = $("#messages")[0];
+                var pendingCandidates = []
+                switch (data.m.o) {
+                    case "peers":
+                        var users = data.p.users;
+                        for(i = 0; i < users.length; i++) {
+                            messagesElement.innerHTML += users[i] + " is in the chat<br>";
+                        }
+                        break;
+                    case "peer_connected":
+                        var f = data.m.f.split("/");
+                        var joining = f[f.length-1];
+                        messagesElement.innerHTML += joining + " has joined the chat<br>";
+                        displayMessage("new user joined:" + joining)
+                        if (joining != localUsername) {
+                            console.log("calling " + joining + " from " + localUsername)
+                            callPeer(joining);
+                        }
+                        break;
+                    case "message":
+                        switch(data.p.msg.type) {
+                            case "offer":
+                                setupIceEvents()
+                                var desc = new RTCSessionDescription(data.p.msg);
+                                var f = data.m.f.split("/");
+                                var sender = f[f.length-1];
+                                pc.setRemoteDescription(desc);
+                                pc.ondatachannel = evt => onDataChannel(evt);
+                                pc.createAnswer().then(d => onCreateAnswer(d, sender));
+                                break;
+                            case "answer":
+                                console.log("answer has arrived")
+                                var desc = new RTCSessionDescription(data.p.msg);
+                                var f = data.m.f.split("/");
+                                var sender = f[f.length-1];
+                                pc.setRemoteDescription(desc);
+                                break;
+                            case "candidate":
+                                displayMessage("you have received a candidate");
+                                var candidate = new RTCIceCandidate(data.p.msg);
+                                pc.addIceCandidate(candidate).catch(e => {
+                                    console.log("ICE Candidate Error: ", e.name, " ", e.message);
+                                    pendingCandidates.push(candidate)
+                                });
+                                // a candidate must be added *after* remoteDescription is set
+                                if (pendingCandidates.length > 0) {
+                                    console.log("adding " + pendingCandidates.length.toString() + " candidates...")
+                                    retries = []
+                                    for (let c of pendingCandidates) {
+                                        pc.addIceCandidate(c).catch(e => {
+                                            console.log("ICE Candidate Error: ", e.name, " ", e.message);
+                                            retries.push(candidate)
+                                        });
+                                    }
+                                    // replace
+                                    pendingCandidates = retries
+                                    console.log(pendingCandidates.length.toString() + ' pending candidates left')
+                                }
+                                break;
+                        }
+                }
+            }
+            function setupIceEvents() {
+                // ice event
+                pc.onconnectionstatechange = evt => displayMessage("peer connection state:" + pc.connectionState);
+                displayMessage("setting onicecandidate eventlistener")
+                pc.onicecandidate = evt => onIceCandidate(evt);
+                pc.oniceconnectionstatechange = evt => displayMessage("ice connection state:" + pc.iceConnectionState);
+            }
+            function callPeer(peer) {
+                displayMessage("you are the caller...calling " + peer);
+                dataChannel = pc.createDataChannel("data");
+                setDataChannelHandlers(dataChannel);
+                setupIceEvents()
+                // create an offer
+                pc.createOffer().then(d => onCreateOffer(d, peer));
+            }
+
+            function setDataChannelHandlers(dc) {
+                dc.onmessage = evt => onDataMessage(evt);
+                dc.onopen = evt => onDataChannelOpen(evt);
+            }
+
+            function onDataChannelOpen(evt) {
+                $("#newMessage")[0].disabled = false;
+                $("#sendButton")[0].disabled = false;
+            }
+
+            function onDataChannel(evt) {
+                dataChannel = evt.channel;
+                setDataChannelHandlers(dataChannel);
+            }
+
+            function send() {
+                var messageElement = $('#newMessage')[0];
+                displayMessage("you said: " + messageElement.value);
+                var message = {f: localUsername, msg: messageElement.value};
+                messageElement.value = "";
+                dataChannel.send(JSON.stringify(message));
+            }
+
+            function onDataMessage(evt) {
+                var messageObj = JSON.parse(evt.data);
+                displayMessage(messageObj.f + " said: " + messageObj.msg);
+            }
+
+            function onCreateOffer(d, peer) {
+                pc.setLocalDescription(d);
+                var pkt = {t: "u", m: {f: "SampleAppChannel/" + localUsername, o: "message", t: peer}, p: {msg:d}};
+                socket.send(JSON.stringify(pkt));
+            }
+            function onCreateAnswer(d, peer) {
+                displayMessage("you are the answerer...you are answering " + peer);
+                pc.setLocalDescription(d);
+                var pkt = {t: "u", m: {f: "SampleAppChannel/" + localUsername, o: "message", t: peer}, p: {msg:d}};
+                socket.send(JSON.stringify(pkt));
+            }
+            function onIceCandidate(evt) {
+                displayMessage("you are sending a candidate");
+                var candidate = evt.candidate;
+                if (evt.candidate != null) {
+                    var cPkt = {type: "candidate",
+                        sdpMLineIndex: candidate.sdpMLineIndex,
+                        sdpMid: candidate.sdpMid,
+                        candidate: candidate.candidate
+                    };
+                    var pkt = {
+                        t: "u",
+                        m: {
+                            f: "SampleAppChannel/" + localUsername,
+                            o: 'message'
+                        },
+                        p: {msg:cPkt}
+                    }
+                    socket.send(JSON.stringify(pkt));
+                }
+            }
+        </script>
+    </body>
+</html>
