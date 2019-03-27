@@ -1,8 +1,9 @@
 import argparse
 import asyncio
 import logging, json, threading, sys, subprocess, os
-import requests, websockets
-import numpy
+from urllib.parse import urlparse
+
+import requests, websockets, numpy
 
 from av import VideoFrame
 from enum import Enum
@@ -46,12 +47,12 @@ class PeerConnection():
         DISCONNECTED = 6
         TERMINATED = 7
 
-    def __init__(self, user_name, xirsys_url, channel_name, video_file, disable_ping_interval):
+    def __init__(self, user_name, xirsys_url, channel_name, video_file, ping_interval):
         self._user = user_name
         self._xirsys_url = xirsys_url
         self._channel_name = channel_name
         self._video_file = video_file
-        self._disable_ping_interval = disable_ping_interval
+        self._ping_interval = ping_interval
         self._state = self.PcState.ICE_NOT_READY
 
         self._wsurl = None
@@ -69,7 +70,7 @@ class PeerConnection():
         logger.debug('state changed from {} to {}'.format(self._state, value))
         self._state = value
 
-    def doIce(self):
+    async def doIce(self):
         
         # 1. get ice servers
         url = "{}/getice.php".format(self._xirsys_url)
@@ -83,14 +84,25 @@ class PeerConnection():
         token = r.json()['v']
         logger.debug('successfully retrieved a token: \t{}'.format(token))
 
-        # 3. getting a host
-        url = "{}/gethost.php".format(self._xirsys_url)
-        r = requests.post(url, verify=False, data={'username': self._user, 'channel': self._channel_name})
-        wshost = r.json()['v']
-        logger.debug('successfuly retrieved a host: \t{}'.format(wshost))
+        # 3. getting a host, and check if it is a valid one
+        tried = 0
+        while self._wsurl is None and tried < 10:
+            url = "{}/gethost.php".format(self._xirsys_url)
+            r = requests.post(url, verify=False, data={'username': self._user, 'channel': self._channel_name})
+            wshost = r.json()['v']
+            logger.debug('successfuly retrieved a host: \t{}'.format(wshost))
+            self._wsurl = '{}/v2/{}'.format(wshost, token)
+            try:
+                async with websockets.client.connect(self._wsurl) as websocket:
+                    logger.debug('successfully connected to {}'.format(self._wsurl))
+            except:
+                logger.exception('failed to connect to the host:\t{}'.format(wshost))
+                self._wsurl = None
+                tried += 1
+        if self._wsurl is None:
+            raise Exception('failed to get a valid host for the signaling')
 
         # 4. peer connection
-        self._wsurl = '{}/v2/{}'.format(wshost, token)
         config = self.generate_rtc_configuration(ice_servers)
         self._pc = RTCPeerConnection(config);
 
@@ -139,7 +151,7 @@ class PeerConnection():
             try:
 
                 if self._state == self.PcState.ICE_NOT_READY:
-                    self.doIce()
+                    await self.doIce()
 
                 #1. wait for a message over signaling
                 logger.info('starting signaling...')
@@ -165,12 +177,8 @@ class PeerConnection():
 
         logger.debug('the websocket url for the signaling is: \t{}'.format(self._wsurl))
 
-        ping_interval = 20
-        if self._disable_ping_interval:
-            ping_interval = None
-
         logger.debug('connecting...')
-        async with websockets.client.connect(self._wsurl, ping_interval=ping_interval) as websocket:
+        async with websockets.client.connect(self._wsurl, ping_interval=self._ping_interval) as websocket:
 
             while not self._state == self.PcState.TERMINATED and websocket.open:
 
@@ -370,6 +378,7 @@ class PeerConnection():
 
         if not self._state == self.PcState.TERMINATED:
             self.state = self.PcState.ICE_NOT_READY
+            self._wsurl = None
 
         return True
 
@@ -384,7 +393,7 @@ if __name__ == '__main__':
     parser.add_argument('user_name', help='a user name for a signaling')
     parser.add_argument('--channel_name', '-c', default='sampleAppChannel', help='a xirsys channel name')
     parser.add_argument('--video_file', '-f', help='a file path to play')
-    parser.add_argument('--disable_ping_interval', '-p', action='store_true', help='disable to send a ping at an interval')
+    parser.add_argument('--ping_interval', '-p', type=int, default=20, help='disable to send a ping at an interval')
     parser.add_argument('--verbose', '-v', action='store_true', help='debug logging enabled if set')
 
     args = parser.parse_args()
@@ -401,7 +410,7 @@ if __name__ == '__main__':
 
     logger.info("getting xirsys ice hosts and tokens as {} with {}".format(args.user_name, args.xirsys_url))
 
-    conn = PeerConnection(args.user_name, args.xirsys_url, args.channel_name, args.video_file, args.disable_ping_interval)
+    conn = PeerConnection(args.user_name, args.xirsys_url, args.channel_name, args.video_file, args.ping_interval)
 
     asyncio.run(conn.run())
 
