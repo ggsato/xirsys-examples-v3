@@ -1,6 +1,6 @@
 import argparse
 import asyncio
-import logging, json, threading, sys, subprocess, os
+import logging, json, threading, sys, subprocess, os, time
 from urllib.parse import urlparse
 
 import requests, websockets, numpy
@@ -55,12 +55,12 @@ class PeerConnection():
         DISCONNECTED = 6
         TERMINATED = 7
 
-    def __init__(self, user_name, xirsys_url, channel_name, video_file, ping_interval):
+    def __init__(self, user_name, xirsys_url, channel_name, video_file, keep_alive_interval):
         self._user = user_name
         self._xirsys_url = xirsys_url
         self._channel_name = channel_name
         self._video_file = video_file
-        self._ping_interval = ping_interval
+        self._keep_alive_interval = keep_alive_interval
         self._state = self.PcState.ICE_NOT_READY
 
         self._socket = None
@@ -113,7 +113,7 @@ class PeerConnection():
         
         # 1. get ice servers
         url = "{}/getice.php".format(self._xirsys_url)
-        r = requests.post(url, verify=False, data={'channel': self._channel_name, 'expire': self._ping_interval})
+        r = requests.post(url, verify=False, data={'channel': self._channel_name, 'expire': self._keep_alive_interval})
         ice_servers = r.json()['v']
         logger.debug('successfully retrieved ice hosts: \t{}'.format(ice_servers))
 
@@ -166,7 +166,7 @@ class PeerConnection():
 
                 #1. wait for a message over signaling
                 logger.info('starting signaling...')
-                await self.keep_signaling()
+                await self.start_signaling()
 
             except KeyboardInterrupt:
 
@@ -184,107 +184,119 @@ class PeerConnection():
                     logger.error('cleanup failed, terminating...')
                     break
 
-    async def keep_signaling(self):
+    async def start_signaling(self):
 
-        logger.debug('connecting...')
-        async with websockets.client.connect(await self.get_wsurl(), ping_interval=self._ping_interval) as websocket:
+        logger.debug('connecting with a keep alive interval = {}...'.format(self._keep_alive_interval))
+
+        signaling_started = time.time()
+
+        # disable the ping pong exchange, which causes the xirsys websocket to send a close request
+        # https://websockets.readthedocs.io/en/stable/api.html#websockets.protocol.WebSocketCommonProtocol
+        async with websockets.client.connect(await self.get_wsurl(), ping_interval=None) as websocket:
 
             while not self._state == self.PcState.TERMINATED and websocket.open:
 
                 try:
 
-                    message = await asyncio.wait_for(websocket.recv(), 1.0)
-
-                    logger.debug('received message over websocket: \t{}'.format(message))
-
-                    data = json.loads(message)
-                    msg_objective = data['m']['o']
-
-                    if msg_objective == 'peers':
-
-                        logger.debug('received peers notification')
-
-                    elif msg_objective == 'peer_connected':
-
-                        logger.debug('received a peer connected')
-                        joined = data['m']['f'].split('/')[-1];
-                        logger.info('{} joined'.format(joined))
-
-                        if joined != self._user:
-
-                            self.state = self.PcState.ICING
-
-                    elif msg_objective == 'peer_removed':
-
-                        left = data['m']['f'].split('/')[-1];
-                        logger.info('{} has left'.format(left))
-
-                    elif msg_objective == 'message':
-
-                        msg = data['p']['msg']
-
-                        if 'type' in msg:
-
-                            msg_type = msg['type']
-
-                            if msg_type == 'offer':
-
-                                logger.info('received an offer')
-                                self.state = self.PcState.ICING
-                                await self.make_answer(websocket, data)
-
-                            elif msg_type == 'answer':
-
-                                logger.info('received an answer')
-
-                            elif msg_type == 'candidate':
-
-                                message = data['p']['msg']
-                                logger.debug('received a candidate\t{}'.format(message))
-                                candidate = candidate_from_sdp(message['candidate'].split(':', 1)[1])
-                                candidate.sdpMid = message['sdpMid']
-                                candidate.spdMLineIndex = message['sdpMLineIndex']
-                                logger.debug('adding a candidate:\t{}'.format(candidate))
-                                self._pc.addIceCandidate(candidate)
-
-                            elif msg_type == 'action':
-
-                                if 'internal' in msg:
-
-                                    code = msg['code']
-
-                                    if code == 'rtc.p2p.close':
-
-                                        logger.info('the call was closed')
-
-                                    elif code == 'rtc.p2p.deny':
-
-                                        logger.info('the call was denied')
-
-                            else:
-
-                                logger.warning('unknown message type: {}'.format(msg_type))
-
-                        else:
-
-                            logger.info('received a command message:\t{}'.format(msg))
-
-                            await self.execute_and_send(websocket, msg)
-
-                    else:
-
-                        logger.warning('unknown message objective: {}'.format(msg_objective))
+                    await self.receive_message(websocket)
 
                 except asyncio.TimeoutError:
-                    logger.debug('regular timeout occured...')
+                    elapsed = time.time() - signaling_started
+                    logger.debug('stopping to receive a message, due to a regular break every 1 second...')
 
                     if self.state == self.PcState.DISCONNECTED:
+                        logger.info('found the current state is closed, terminating the signaling...')
+                        break
+
+                    if elapsed > self._keep_alive_interval and self.state == self.PcState.ICE_READY:
+                        logger.info('{} already passed, the ice credential is expired, renewing...'.format(self._keep_alive_interval))
                         break
 
                 except websockets.exceptions.ConnectionClosed:
                     logger.error('websocket connection closed')
+                    self.state = self.PcState.TERMINATED
 
         logging.debug('finished signaling')
+
+    async def receive_message(self, websocket):
+
+        message = await asyncio.wait_for(websocket.recv(), 1.0)
+
+        logger.debug('received message over websocket: \t{}'.format(message))
+
+        data = json.loads(message)
+        msg_objective = data['m']['o']
+
+        if msg_objective == 'peers':
+
+            logger.debug('received peers notification')
+
+        elif msg_objective == 'peer_connected':
+
+            logger.debug('received a peer connected')
+            joined = data['m']['f'].split('/')[-1];
+            logger.info('{} joined'.format(joined))
+
+        elif msg_objective == 'peer_removed':
+
+            left = data['m']['f'].split('/')[-1];
+            logger.info('{} has left'.format(left))
+
+        elif msg_objective == 'message':
+
+            msg = data['p']['msg']
+
+            if 'type' in msg:
+
+                msg_type = msg['type']
+
+                if msg_type == 'offer':
+
+                    logger.info('received an offer')
+                    self.state = self.PcState.ICING
+                    await self.make_answer(websocket, data)
+
+                elif msg_type == 'answer':
+
+                    logger.error('received an answer, but which should not happen')
+
+                elif msg_type == 'candidate':
+
+                    message = data['p']['msg']
+                    logger.debug('received a candidate\t{}'.format(message))
+                    candidate = candidate_from_sdp(message['candidate'].split(':', 1)[1])
+                    candidate.sdpMid = message['sdpMid']
+                    candidate.spdMLineIndex = message['sdpMLineIndex']
+                    logger.debug('adding a candidate:\t{}'.format(candidate))
+                    self._pc.addIceCandidate(candidate)
+
+                elif msg_type == 'action':
+
+                    if 'internal' in msg:
+
+                        code = msg['code']
+
+                        if code == 'rtc.p2p.close':
+
+                            logger.info('the call was closed')
+
+                        elif code == 'rtc.p2p.deny':
+
+                            logger.info('the call was denied')
+
+                else:
+
+                    logger.warning('unknown message type: {}'.format(msg_type))
+
+            else:
+
+                logger.info('received a command message:\t{}'.format(msg))
+
+                await self.execute_and_send(websocket, msg)
+
+        else:
+
+            logger.warning('unknown message objective: {}'.format(msg_objective))
 
     async def execute_and_send(self, websocket, message):
 
@@ -401,7 +413,7 @@ if __name__ == '__main__':
     parser.add_argument('user_name', help='a user name for a signaling')
     parser.add_argument('--channel_name', '-c', default='sampleAppChannel', help='a xirsys channel name')
     parser.add_argument('--video_file', '-f', help='a file path to play')
-    parser.add_argument('--ping_interval', '-p', type=int, default=20, help='disable to send a ping at an interval')
+    parser.add_argument('--keep_alive_interval', '-i', type=int, default=20, help='the duration of a keep alive interval')
     parser.add_argument('--verbose', '-v', action='store_true', help='debug logging enabled if set')
 
     args = parser.parse_args()
@@ -416,9 +428,9 @@ if __name__ == '__main__':
         logging.error('xirsysurl should starts with http(s), exitting...')
         sys.exit(1)
 
-    logger.info("getting xirsys ice hosts and tokens as {} with {}".format(args.user_name, args.xirsys_url))
+    logger.info("launching a program with args = {}".format(args))
 
-    conn = PeerConnection(args.user_name, args.xirsys_url, args.channel_name, args.video_file, args.ping_interval)
+    conn = PeerConnection(args.user_name, args.xirsys_url, args.channel_name, args.video_file, args.keep_alive_interval)
 
     asyncio.run(conn.run())
 
