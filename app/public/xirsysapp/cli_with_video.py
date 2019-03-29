@@ -49,9 +49,16 @@ class PeerConnection():
         # start gathering before the retrieved credential expires
         ICE_READY = 2
 
+        # setRemoteDescription ==> ICING ==> iceConnectionState completed
+        # note that "completed" means both of a success and a failure
         ICING = 3
+
+        # iceConnectionState completed ==> CONNECTING ==> dtls state connected
         CONNECTING = 4
+
+        # dtls state connected ==> CONNECTED ==> dtls state disconnected
         CONNECTED = 5
+
         DISCONNECTED = 6
         TERMINATED = 7
 
@@ -208,8 +215,8 @@ class PeerConnection():
                         logger.info('found the current state is closed, terminating the signaling...')
                         break
 
-                    if elapsed > self._keep_alive_interval and self.state == self.PcState.ICE_READY:
-                        logger.info('{} already passed, the ice credential is expired, renewing...'.format(self._keep_alive_interval))
+                    if elapsed > self._keep_alive_interval and not self.state == self.PcState.CONNECTED:
+                        logger.info('{} seconds already passed, the ice credential is expired, retrying from scratch...'.format(self._keep_alive_interval))
                         break
 
                 except websockets.exceptions.ConnectionClosed:
@@ -253,7 +260,6 @@ class PeerConnection():
                 if msg_type == 'offer':
 
                     logger.info('received an offer')
-                    self.state = self.PcState.ICING
                     await self.make_answer(websocket, data)
 
                 elif msg_type == 'answer':
@@ -332,6 +338,7 @@ class PeerConnection():
         remote_desc = RTCSessionDescription(**data['p']['msg']);
         await self._pc.setRemoteDescription(remote_desc)
 
+        self.state = self.PcState.ICING
         self.setup_iceevents()
 
         # recorder start
@@ -389,7 +396,9 @@ class PeerConnection():
         @self._sender.transport.on('statechange')
         async def on_dtlsstatechanged():
             logger.debug('dtls state changed to {}'.format(self._sender.transport.state))
-            if self._sender.transport.state == 'closed':
+            if self._sender.transport.state == 'connected':
+                self.state = self.PcState.CONNECTED
+            elif self._sender.transport.state == 'closed':
                 self.state = self.PcState.DISCONNECTED
 
     async def cleanup(self):
