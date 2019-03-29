@@ -39,8 +39,16 @@ class FlagVideoStreamTrack(VideoStreamTrack):
 class PeerConnection():
 
     class PcState(Enum):
-        ICE_READY = 1
-        ICE_NOT_READY = 2
+        # no ice host including credential information is retrieved
+        # note that it has an expiration, 30 seconds by default, see more below
+        # https://docs.xirsys.com/?pg=api-turn#managing-expiring-credentials
+        # this duration of an expiration is set by _ping_interval
+        ICE_NOT_READY = 1
+
+        # ice host information was retrieved
+        # start gathering before the retrieved credential expires
+        ICE_READY = 2
+
         ICING = 3
         CONNECTING = 4
         CONNECTED = 5
@@ -55,7 +63,6 @@ class PeerConnection():
         self._ping_interval = ping_interval
         self._state = self.PcState.ICE_NOT_READY
 
-        self._wsurl = None
         self._socket = None
         self._ice_state = None
         self._sender = None
@@ -70,43 +77,51 @@ class PeerConnection():
         logger.debug('state changed from {} to {}'.format(self._state, value))
         self._state = value
 
-    async def doIce(self):
-        
-        # 1. get ice servers
-        url = "{}/getice.php".format(self._xirsys_url)
-        r = requests.post(url, verify=False, data={'channel': self._channel_name})
-        ice_servers = r.json()['v']
-        logger.debug('successfully retrieved ice hosts: \t{}'.format(ice_servers))
+    async def get_wsurl(self):
 
-        # 2. getting a temp token
+        wsurl = None
+
+        # 1. getting a temp token
         url = "{}/gettoken.php".format(self._xirsys_url)
         r = requests.post(url, verify=False, data={'username': self._user, 'channel': self._channel_name})
         token = r.json()['v']
         logger.debug('successfully retrieved a token: \t{}'.format(token))
 
-        # 3. getting a host, and check if it is a valid one
+        # 2. getting a host, and check if it is a valid one
         tried = 0
-        while self._wsurl is None and tried < 10:
+        while wsurl is None and tried < 10:
             url = "{}/gethost.php".format(self._xirsys_url)
             r = requests.post(url, verify=False, data={'username': self._user, 'channel': self._channel_name})
-            wshost = r.json()['v']
+            js_r = r.json()
+            logger.debug('received js_host:\t{}'.format(js_r))
+            wshost = js_r['v']
             logger.debug('successfuly retrieved a host: \t{}'.format(wshost))
-            self._wsurl = '{}/v2/{}'.format(wshost, token)
+            wsurl = '{}/v2/{}'.format(wshost, token)
             try:
-                async with websockets.client.connect(self._wsurl) as websocket:
-                    logger.debug('successfully connected to {}'.format(self._wsurl))
+                async with websockets.client.connect(wsurl) as websocket:
+                    logger.debug('successfully connected to {}'.format(wsurl))
             except:
                 logger.exception('failed to connect to the host:\t{}'.format(wshost))
-                self._wsurl = None
+                wsurl = None
                 tried += 1
-        if self._wsurl is None:
+        if wsurl is None:
             raise Exception('failed to get a valid host for the signaling')
 
-        # 4. peer connection
+        return wsurl
+
+    async def doIce(self):
+        
+        # 1. get ice servers
+        url = "{}/getice.php".format(self._xirsys_url)
+        r = requests.post(url, verify=False, data={'channel': self._channel_name, 'expire': self._ping_interval})
+        ice_servers = r.json()['v']
+        logger.debug('successfully retrieved ice hosts: \t{}'.format(ice_servers))
+
+        # 2. peer connection
         config = self.generate_rtc_configuration(ice_servers)
         self._pc = RTCPeerConnection(config);
 
-        # 5. add track event callback
+        # 3. add track event callback
         logger.debug('preparing black hole media as a sink')
         self._recorder = MediaBlackhole()
         @self._pc.on('track')
@@ -140,10 +155,6 @@ class PeerConnection():
 
         return RTCConfiguration(rtc_ice_servers)
 
-    @property
-    def wsurl(self):
-        return self._wsurl
-
     async def run(self):
 
         while not self._state == self.PcState.TERMINATED:
@@ -175,10 +186,8 @@ class PeerConnection():
 
     async def keep_signaling(self):
 
-        logger.debug('the websocket url for the signaling is: \t{}'.format(self._wsurl))
-
         logger.debug('connecting...')
-        async with websockets.client.connect(self._wsurl, ping_interval=self._ping_interval) as websocket:
+        async with websockets.client.connect(await self.get_wsurl(), ping_interval=self._ping_interval) as websocket:
 
             while not self._state == self.PcState.TERMINATED and websocket.open:
 
@@ -378,7 +387,6 @@ class PeerConnection():
 
         if not self._state == self.PcState.TERMINATED:
             self.state = self.PcState.ICE_NOT_READY
-            self._wsurl = None
 
         return True
 
